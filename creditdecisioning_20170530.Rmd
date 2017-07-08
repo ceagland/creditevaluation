@@ -1,0 +1,607 @@
+---
+title: "Credit Decisioning with R"
+author: "Cole Eagland"
+date: "May 2017"
+output:
+  pdf_document: 
+    fig_caption: false
+---
+
+<style type="text/css">
+.table {
+    width: 70%;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,cache=TRUE, warning=FALSE,cache.lazy=FALSE,tidy.opts=list(width.cutoff=60),tidy=TRUE)
+library(knitr)
+library(printr)
+library(tidyverse)
+library(scales)
+knit_hooks$set(plot = function(x, options) {
+  paste('<figure><figcaption>', options$fig.cap, '</figcaption><img src="',
+        opts_knit$get('base.url'), paste(x, collapse = '.'),
+        '"></figure>',
+        sep = '')
+})
+```
+```{r echo=FALSE}
+#cpr <- read.csv("cprmedianimputed.csv")
+#cprcheckcode <- read.csv("cprcombinedwithGOODBAD.csv")
+```
+
+
+##Executive Summary
+This report creates a credit scoring model to determine which applicants for credit should be extended offers to maximize profit - partly by making good loans to low risk applicants, and by avoiding bad loans to high risk applicants. The dataset used includes nearly 1.5 million customers and 338 variables with information about the credit history of each customer. An additional dataset is used with information on credit results - customers with no record of payments greater than 60 days past due are considered good risks, and customers with at least one past due greater than 60 days are thought of as "defaults".
+
+The R Programming Language is used to create the full analysis to follow. In the following paper, the following steps are taken to create a well-performing model:
+
+* Data Preparation: Missing and coded values in the data are handled through imputation - the median is used to replace missing and coded values, and values with greater than 40% missing values are removed from the data set.
+
+* Variable Reduction: A hierarchical clustering procedure is used to reduce the variable count to 33 (from our initial dataset of 338 variables, a 90%+ reduction)
+
+* Discretization and Transformation: New variables are created by "binning" the values of continous variables, the transforming the variables using odds and logit transformations. At the end of this process, the 33 base variables are increased to 180.
+
+* Modeling with Logistic Regression: A backwards elimination procedure using the Akaike Information Criterion is used to identify variables that fit well in the model. The best models with 4 predictors up to 75 predictors are compared to determine the best performing model with the fewest number of variables - minimizing inputs minimizes cost and complexity. In this case, the tradeoff between performance and simplicity is minimal, as shown in the profit results. The model chosen includes 8 predictor variables (inputs).
+
+* Profitability: The model returns a probability of default for each customer - an optimal probability cutpoint is chosen to maximize profit. A cutpoint of 0.19 yields the maximum profit of $132,580 per 1,000 customers. In other words, credit is offered to all customers with a 19% probability or lower of defaulting (based on the created model) and the resulting profit is expected to be $132,580 per customer.
+
+
+## Introduction
+
+This paper describes using R to develop a binary classification model using Logistic Regression to generate credit risk Scores.
+
+The data for this project came from a Sub-Prime lender.
+
+Three datasets are provided:
+
+* CPR.  1,462,955 observations and 338 variables.  Each observation represents a unique customer.  This file contains all the potential predictors of credit performance.  The variables have differing levels of completeness.
+
+* PERF.  17,244,104 observations and 18 variables.  This file contains the post hoc performance data for each customer, including the response variable for modeling - DELQID.
+
+* TRAN.  8,536,608 observations and 5 variables.  This file contains information on the transaction patterns of each customer.
+
+Each file contains a consistent "matchkey" variable which is used to merge the datasets.
+
+
+
+
+
+
+
+![](images/dataprocess.png)
+
+
+## Data Discovery
+
+Once we are familiar with the data, the first thing to do is to merge the CPR and PERF data sets.
+
+The CPR data set includes (but is not limited to) balances, payment status, and bad debt markers for different credit vehicles, such as Auto Finance, Credit Cards (Bank Revolving), and Department Store Accounts. It also includes more general information such as the number of open accounts and information on credit inquiries.
+
+The PERF data set includes 12 months of performance data. Most users (identified by the MATCHKEY variable) appear multiple times in the PERF data set - once for each month the user had a credit product.
+
+Combined, the raw CPR and PERF files take up 3.7GB of space.
+
+**Challenge:** R stores data in memory. A 100MB dataset read into R occupies 100MB of RAM, and 3.7GB of data occupies 3.7GB of RAM. On a computer with 8GB of RAM and minimal requirements for other processes, working with 3.7GB of data can result in errors and interrupted processing.
+
+**Solution:** The data is read and reduced before trying to merge data sets, and eventually split into smaller chunks and reassembled.
+
+
+The CPR Data set has very little initial cleanup that can be done before merging. The PERF data set has only 3 variables to be used for analysis: DELQID (a measure of delinquency, which will become our primary variable of interest), CRELIM (credit limit), and MATCHKEY (an ID that uniquely identifies a customer.
+
+Because it's an easy data reduction, the PERF dataset is read in first and all non-usable variables removed. 
+
+
+```{r, eval=FALSE}
+#Reading in full data set
+perfall <- read.csv("perffull.csv") #17,244,104 observations and 18 variables
+
+#Retaining 3 useful variables and sorting by highest DELQID for each MATCHKEY
+perfsrt <- perfall[,c("MATCHKEY","DELQID","CRELIM")]
+
+#Removing large data set to clear space in RAM + garbage collection
+rm(perfall); gc()
+
+```
+
+
+To leave as much space in memory as possible, the starting data set is removed from the global environment with rm(). Another function, gc() is used for "garbage collection". This frees up unused memory after the removal of an object from the R environment. There is some debate on whether there's value in garbage collection or if it runs automatically - in this case, there seemed to be a small but not insignificant freeing of memory using gc(), shown in Figure 1 below. gc() has little value for small data sets.
+
+![Figure 1: Memory usage reduction with use of gc() function in R](images/memoryusagegc.png)
+
+Now, with a much reduced PERF file size (2.1GB to 446MB), the CPR data set can be read in. The next step, merging the datasets, is informed by the knowledge that each user appears multiple times in the PERF data set, as well as the interpretation of the DELQID variable, show below in Table 1.
+
+
+```{r, echo=FALSE,warning=FALSE}
+delqtbl <- data.frame(Value=c(0,1,2,3,4,5,6,7),
+                      Meaning=c("Too new to rate","Good Standing","1 cycle late (30 days)",
+                          "2 cycles late","3 cycles late","4 cycles late","5 cycles late",
+                          "6+ cycles rate (180 days)"))
+
+kable(delqtbl,align='l',caption="Table 1: Levels of DELQID")
+#kable(cpr$GOODBAD,caption="Table 2: GOODBAD Results")
+
+```
+
+
+Because we will only use a single performance entry for each user, the maximum DELQID from the PERF data set is chosen for merging with the CPR data set. Choosing the maximum DELQID scores each consumer based on their worst credit performance over the one-year period.
+
+To take the maximum DELQID for each user, the PERF data is sorted with the DELQID descending for each MATCHKEY before the merge. While removing duplicate users, the first instance of MATCHKEY will be retained, and so sorting by MATCHKEY then descending DELQID will return the highest DELQID for each user.
+
+
+```{r, eval=FALSE}
+#Use the arrange function from the dplyr package to sort data
+perfsrt <- arrange(perfsrt,MATCHKEY,desc(DELQID))
+
+#Retain the highest DELQID value for each user
+perf.maxdelq <- perfsrt[!duplicated(perfsrt1$MATCHKEY),]
+rm(perfsrt); gc()
+```
+
+
+This is the point at which the data becomes hard to work with. While the total file size is 1.65GB between the edited PERF file and the CPR file, merging the files, even while trying to overwrite the larger file, causes R to return an error: *cannot allocate vector of size x* and terminate the process.
+
+The solution is ugly - the data is broken into 5 pieces (2 shown below), written to csv, then re-read back into R piece by piece in small chunks until the full file is recreated. At the end of this process, duplicates are removed, leaving us with 339 variables and 1,255,429 observations.
+
+
+
+
+
+
+
+```{r, eval=FALSE}
+#Splitting the data into 300,000 record chunks, merging with PERF, and writing to csv
+cpr1 <- cpr[1:300000,]
+merged1 <- merge(cpr1, perf.maxdelq, by="MATCHKEY")
+write.csv(merged1,"merged1.csv")
+rm(cpr1,merged1)
+cpr2 <- cpr[300001:600000,]
+merged2 <- merge(cpr2, perf.maxdelq, by="MATCHKEY")
+write.csv(merged2,"merged2.csv")
+rm(cpr2,merged2)
+...
+
+#Reading and combining (binding) merged data sets
+merged1 <- read.csv("merged1.csv")
+merged2 <- read.csv("merged2.csv")
+cpr <- rbind(merged1,merged2)
+rm(merged1,merged2)
+
+#Removing unused variables/observations
+cpr$BEACON <- NULL #An unnecessary variable
+cpr <- distinct(cpr)  #dply - there are about 200k duplicate observations
+
+#Result - 1,255,429 observations and 339 variables
+```
+
+---
+
+**Note**
+
+An alternative method that makes sense for regular usage is to use free or inexpensive Cloud Computing resources. Amazon Web Services offers a free tier and there are resources for running R/RStudio in the Cloud. There are many online resources to assist with setup and once setup is complete, even RStudio in one of the AWS free tiers will perform better than most Desktop computers.
+
+---
+
+
+##Creation of the dependent variable
+
+The DELQID variable now represents the maximum amount of time a user has been delinquent in the year recorded. To make the variable binary for use in logistic regression, DELQID is categorized into 2 levels in the variable GOODBAD. DELQID values greater than 2 [3-7] are assigned a value of 1. This means anyone who is more than 1 cycle late at any point in the performance data is considered a higher risk of default. All DELQIDs less than or equal to 2 (too new to rate, good standing, max 1 cycle late) are assigned a GOODBAD value of 0. The reason 1 cycle late consumers are included as "good/0" is that many people with fantastic credit/payback performance will occasionally forget to pay a bill - however, they generally will catch up on the bill after missing it the first time. This is less likely to occur for 2 months in a row, so 2 months+ is a better indicator of cannot/will not pay.
+
+The created GOODBAD variable will be used as our dependent variable for modeling, and is distributed as shown in Table 2. We will use 17.57% as a proxy for default rate during the modeling process.
+
+
+```{r eval=FALSE}
+#Creating GOODBAD dependent variable (binary)
+cpr$GOODBAD <- with(cpr,ifelse(DELQID<3,0,1))
+GOODBAD.tbl <- table(cpr$GOODBAD)
+names(GOODBAD.tbl) <- c("Good Loan","Default")
+round(prop.table(GOODBAD.tbl),4)*100
+
+```
+
+```{r echo=FALSE}
+table2 <- data.frame("Good Loan"=82.4, "Default"=17.6)
+kable(table2, align="l",caption="Table 2: Frequency of Results in Dependent Variable GOODBAD")
+```
+
+
+##Variable Preparation
+
+###Imputation of coded and extreme values (with variable reduction)
+
+All but 11 of the remaining 339 variables have coded values. These values depend on the scale of the data. For variables with values in the tens of thousands, the values are coded as high as 9,999,999. For variables with proportion values, the coded value is 9.9999. There are multiple codes, but the lowest in each is a series of 9's followed by a 2. If the coded value is 999, then 992, 993, and 997 are also coded values, for example.
+
+Figure 1 shows the distribution of the Age variable. The coded values stand out in the data - many variables have similar distributions at the extreme high end of their scale.
+
+
+```{r fig.width=10}
+cprage <- read.csv("knitrfiles/cprageonly.csv")
+names(cprage) <- "AGE"
+colors <- c(rep("grey",75),rep("blue",8))
+ggplot(cprage,aes(x=AGE)) +
+  geom_histogram(binwidth = 1,fill=colors,alpha=0.8) +
+  theme_bw() +
+  scale_x_continuous(breaks=seq(0,100,5)) +
+  scale_y_continuous(labels=comma) +
+  ggtitle("Figure 1: Histogram of Age variable showing Coded values (92 and 99)") +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  annotate("text", x=95, y=12000, label="Coded Values", color="blue") +
+  ylab("Frequency") +
+  xlab("Age") 
+```
+
+
+To deal with coded values, they are first identified, then set to missing, then imputed (explained in more detail later). As with initial data cleaning, memory becomes an issue. Once early identification is complete, a single loop could potentially identify and change all coded values to missing. However - the memory limitations prevent such a short solution, and it's also worth considering that the logic required to identify is more complex than managing each case of coded values separately.
+
+To determine which variables have which type of coding, we can look at the maximum value of each variable. The sample of variables in Table 3 shows a few variables with different types of coding. Variables like BKP (Bankruptcy) or LAAGE (Age of Last Activity) are not coded. This is the exception. To turn the coded values into missing the variables are separated by the type of coding, then examined for which values are coded, and then loops are used in R to quickly replace the coded values.
+
+
+```{r eval=FALSE}
+#Creating 4 vectors with the maximum value of each variable (4 vectors due to memory constraints)
+a1 <- apply(cpr[,1:100],2,max)
+a2 <- apply(cpr[,101:200],2,max)
+a3 <- apply(cpr[,201:300],2,max)
+a4 <- apply(cpr[,301:339],2,max)
+
+#This step is necessary to get a clean 2 column table with the list of variables and their maximum values
+cpr.varnames <- c(names(a1),names(a2),names(a3),names(a4))
+cpr.maxnum <- data.frame(c(a1,a2,a3,a4))
+colnames(cpr.maxnum) <- "MaxOfVar"
+cpr.maxnum$X = cpr.varnames
+format(cpr.maxnum,scientific=FALSE)
+cpr.maxnum <- format(cpr.maxnum,scientific=FALSE)
+table(cpr.maxnum$MaxOfVar)
+
+#Table 3 Description added for readability (code not included)
+```
+
+```{r echo=FALSE}
+table3 <- read.csv("knitrfiles/cprmaxnumFORSHOW.csv",stringsAsFactors = FALSE)
+kable(table3, caption="Table 3: Sample of Variables with Maximum Values (to Demonstrate Existence of Coded Values)")
+
+```
+
+
+In replacing coded values with missing values, a new problem arises - some variables have a high proportion of data missing. Figure 2 shows the distribution of missing data. The majority of variables are missing greater than 40% of their observations. To avoid imputing too much of the data, all variables missing more than 35% of observations are removed, leaving a total of 128 variables (with the same 1,255,429 observations). Programatically, this step is completed while changing coding values to missing.
+
+
+```{r fig.width=10}
+MissingCounts <- read.csv("knitrfiles/missingdatafrequency.csv")
+ggplot(MissingCounts,aes(x=value/1255429)) +
+  geom_histogram(binwidth = 0.05,fill="grey",alpha=0.8) +
+  theme_bw() +
+  scale_x_continuous(breaks=seq(0,1,0.05)) +
+  scale_y_continuous(labels=comma) +
+  ggtitle("Figure 2: Missing Data Distribution") +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  ylab("Number of Variables") +
+  xlab("Proportion Missing") 
+
+```
+
+
+The code below shows the actual splitting of the data and loop to create missing values and remove variables missing more than 35%. The process used in the loops creates additional attributes in the data frame that add no value. Once the split data sets are combined, these attributes are removed.
+
+
+```{r eval=FALSE}
+#Coded cpr types - variables split into 6 groups based on the maximum value (abridged)
+cols9.9999  <- cpr.maxnum$X[as.numeric(cpr.maxnum$MaxOfVar)==9.9999]
+...
+cols9999999 <-cpr.maxnum$X[as.numeric(cpr.maxnum$MaxOfVar)==9999999]
+remaining   <- cpr.maxnum$X[!(as.numeric(cpr.maxnum$MaxOfVar) %in% c(9.9999,99,999,9999,9999999))]
+
+#Examining Frequency Tables for some variables in each group to determine the minimum coded value (abridged)
+table(cpr$AGE)
+
+#splitting data based on coded values (6 types - only 11 variables do not have coded values)
+ten <- cpr[,cols9.9999]     #36  variables
+hndrd <- cpr[,cols99]       #219 variables
+thsnd <- cpr[,cols999]      #4   variables
+tthsnd <- cpr[,cols9999]    #11  variables
+tmill <- cpr[,cols9999999]  #58  variables
+remain <- cpr[,remaining]   #11  variables
+
+#A loop with conditional logic to change coded values to missing (1 of 5 loops shown)
+for(i in names(ten)) {
+  ten[i] <- ifelse(ten[i] > 9.9992, NA, ten[,i])
+  #Removes variable if missing > 35% of data
+  ten <- ten[,colMeans(is.na(ten))<0.35]
+}
+...
+
+#Creating full data set with missing values - 163 vars, 1255429 obs
+cprcodedtomissing <- cbind(remain,ten,hndrd,thsnd,tthsnd,tmill)
+
+#Reviewing Missing by Variable
+round(colSums(is.na(cpr))/nrow(cpr),2)
+
+#Removing unnecessary attributes from data frame
+for (var in names(newcpr)) {
+  attributes(newcpr[,deparse(as.name(var))]) <- NULL
+}
+
+```
+
+
+Finally, the imputation.
+
+Univariate imputation is used - all coded values in a variable are replaced with the median of the same variable. We choose median over the mean because it is resistant to the dramatic skewness taking place in these data sets, and so is a much better measure of central tendency. Table 4 shows how much the mean of BRMAXB (Maximum Open Bank Revolving Balance) is affected by the coded valuables, while the median barely moves. Even after removing coded values, the much higher mean indicates right-skewed data.
+
+
+```{r, echo=FALSE}
+table4 <- data.frame("Variable State"=c("With Coded Observations","Coded Observations Removed"),
+           n=c("1,255,429","1,224,863"),Mean=c("$246,365","$2,967"),
+           Median=c("$1,998","$1,943"),"Std Dev"=c("$1,540,788","$3,341"))
+names(table4) <- c("Variable State","n","Mean","Median","Standard Deviation")
+kable(table4,caption="Table 4: BRMAXB Summary Statistics with and without Coded Observations")
+```
+
+
+```{r, eval=FALSE}
+#Median Imputation - Missing values; Extreme values set to mean+4*SD
+std <- 4
+##ifelse statements run one by one, in order - variables are treated differently to avoid imputing non-integer
+##values for interger variables
+cpr <- data.frame(lapply(cpr,function(x) {
+  #ifelse(is.na(x),median(x,na.rm=T),x)
+  #ifelse(x>(mean(x,na.rm=T)+mstd*sd(x,na.rm=T)) & class(x)=="integer",as.integer(ceiling(mean(x,na.rm=T)+(3*sd(x,na.rm=T)))),x)
+  #ifelse((x>mean(x,na.rm=T)+mstd*sd(x,na.rm=T)) & class(x)=="numeric",mean(x,na.rm=T)+3*sd(x,na.rm=T),x)
+}))
+```
+
+
+##Variable Clustering
+
+At this point, with 128 variables, it would still be impractical to proceed with modeling. TO further reduce the variable count, the R package ClustOfVar is used. ClustOfVar uses a base R function called hclustvar to return more readable results and allow easy reduction to a specified number of clusters. The hclustvar function performs agglomerative hierarchical clustering on the variables (it starts with many clusters and reduces them down to a single cluster - we choose the number of clusters that looks appropriate. The dendrogram in Figure 3 is difficult to read given the number of variables, but gives some idea of how the clustering works.
+
+The idea is to choose the number of clusters and a representative variable from each cluster such that we can represent the same main ideas from each cluster and get nearly the same information from fewer variables. Though it's not quite factor analysis or PCA, some of the principles are the same. In this case, the number of clusters chosen is 33 - some clusters have only a single variable that did not correlate highly with other clusters, and some clusters have 5 or 6 variables.The output available is a matrix with the squared correlations of each variable with it's cluster center (the first principal component).
+
+---
+
+**An aside**: *comparison with SAS:* SAS uses a procedure, PROC VARCLUS, that has two benefits over R's hclust:
+
+1) It gives a clean output with an easily interpretable decision process - each variable is output with the value $(1-R^2)\ with\ variables\ in\ own\ cluster / (1-R^2)\ with\ variables\ in\ closest\ cluster$. Generally, the variable with the lowest ratio should be chosen as the representative variable. The benefit is the comparison with the closest cluster, which R's hclust function does not do, though it's certainly possible through a series of tedious calculations.
+
+2) PROC VARCLUS has an automated variable selection procedure through an option to choose to split clusters only if the second eigenvalue of the covariance matrix is greater than the selected option (this defaults to 1 if analyzing the correlation matrix). A higher value results in fewer clusters as the standard for splitting is more restrictive.
+
+---
+
+Table 5 shows a single cluster created with R's ClustOfVar package and the squared correlations. As a rough measure, the variable with the highest squared correlation is selected for inclusion. In this case, TR4524 has the highest squared correlation, at 0.85, and so is chosen as the archetype for the idea represented in the cluster while the remaining variables are discarded.
+
+
+```{r, echo=FALSE}
+table5 <- data.frame(Variable=c("CRATE45","TRATE45","TR4524","BRCRATE4","BRRATE45"),
+                     Squared.Correlation=c(0.733,0.802,0.850,0.723,0.807))
+names(table5) <- c("Variable","Squared Correlation")
+kable(table5,caption="Table 5: A Sample Cluster with Squared Correlations")
+```
+
+
+The dendrogram shown in Figure 3 is difficult to read. However, dendrograms are a good way to visualize the idea of hierarchical clustering. At the top level is a single cluster, and working downwards in the tree there are more and more clusters for potential choosing. Note that in this type of clustering (agglomerative), the top cluster is not split - rather, all of the variables are clustered until only a single cluster remains.
+
+![](images/dendrogram.png)
+
+```{r echo=FALSE, fig.height=6, fig.width=10}
+library(ggdendro)
+dendata <- readRDS("knitrfiles/dendata")
+p <- ggplot(segment(dendata)) +
+  geom_segment(aes(x=x,y=y,xend=xend,yend=yend)) +
+  geom_text(data=dendata$labels, aes(x=x,y=y,label=label),size=2,hjust="left",nudge_y=-1.75,angle=90) +
+  theme_dendro() +
+  ggtitle("Figure 3: Cluster Dendrogram")
+p
+```
+```{r eval=FALSE}
+#Converting to matrix for Variable Clustering
+#Calculation time is high - using subset of 30000 values
+cprshort <- cpr[!names(cpr) %in% c(keyvarlist,"AGE")]
+cprmat <- as.matrix(cprshort[1:30000,])
+
+#Using ClustOfVar package to create clusters (33 created)
+#Actual Clustering
+VarClusters <- hclustvar(X.quanti=cprmat)
+clustersCOV <- cutreevar(VarClusters,k=33)
+
+#Dendrogram (using ggdendro and ggplot2 packages)
+denclust <- as.dendrogram(VarClusters)
+dendata <- dendro_data(denclust,type="rectangle")
+
+p <- ggplot(segment(dendata)) +
+  geom_segment(aes(x=x,y=y,xend=xend,yend=yend)) +
+  geom_text(data=dendata$labels, aes(x=x,y=y,label=label),size=3,hjust="left",nudge_y=-1.75,angle=90) +
+  theme_dendro() +
+  ggtitle("Figure 3: Cluster Dendrogram")
+p
+
+#Printing clusters with squared correlations
+clustersCOV$var
+
+#Clusters were examined in Excel and read back in once final decisions were made
+keyvarlist <- c("MATCHKEY","GOODBAD","CRELIM")
+clusternames <- c(keyvarlist,read.csv("ClustersForImport.csv",stringsAsFactors = FALSE)[,"Variable"])
+cpr36 <- cpr[names(cpr) %in% clusternames]
+
+
+```
+
+
+Following variable clustering, there are 36 variables (33 from cluster + MATCHKEY, GOODBAD, and CRELIM) and 1,255,429 observations.
+
+
+##Discretization and Transformation
+
+
+With only 33 variables remaining, it is easier to review variables individually and transform them for ease of interpretation. Continous variables are binned into discrete groups, first with an eye to equal frequencies in each group, and then to make sure the bins are different from one another. If 2 contiguous bins have the same default rate, for example, the bins can be collapsed into a single bin. While the bins will no longer have equal frequencies, the interpretation of the variable is generally more obvious (because different bins carry different results).
+
+Beyond discretization, the variables are also transformed using the odds of default and log of the odds of default (the dependent variable). The mean default rate is calculated for each group, and then the variable is transformed using $mean\ default\ rate / 1 -\ mean\ default\ rate$, or the odds ratio. For the BKP variable (binary - whether the customer has had a bankruptcy) with only 0/1 values, each 0 value becomes the odds of default if there is no bankruptcy, and each 1 value becomes the odds of default if the customer has had a bankruptcy. The idea is to make variables that are more mathematically optimal and "play nice" with the dependent variable.
+
+In this case, variables were discretized into 10 different bins if the variables had greater than 12 unique values. For variables with 12 unique values or fewer, the bins were created manually (or in some cases, not created at all if there was already good separation between bins). Table 6 shows a before-and-after discretization of the BADPR1 (# of 90-120 Bad Debt Derogatory Publics Records in 24 Months) Variable. The interpretation of the bins and changing default rate is shown in Figure 4.
+
+
+```{r, echo=FALSE}
+#table6 <- data.frame(BADPR1=seq(0,14,1), Raw.Form=c(9.59,15.68,19.87,23.37,26.59,28.74,30.99,32.41,35.04),
+       #              Collapsed.Bins=c(9.59,15.68,19.87,23.37,26.59,28.74,30.99,32.41,37.38,NA,NA,NA,NA,NA,NA))
+table6 <- read.csv("knitrfiles/BADPR1cattbl.csv")
+names(table6) <- c("BADPR1 Value","Raw Form","Collapsed Bins")
+kable(table6,caption="Table 6: BADPR1 Variable with Mean of GOODBAD at each level for both raw form and collapsed bins")
+```
+
+
+
+Some variables show subtle changes in default rate between bins. Figure 4 shows an example of a variable, BADPR1_cat (a discretized version of BADPRI), with some differentiation. The lowest bin (0 value) has an average default rate of just under 10%. The highest bin (8) has an average default rate of nearly 40%.
+
+![](images/Figure4.png)
+
+After creating transformed versions of variables, there are 180 variables and 1,255,429 observations in the model.
+
+#Modeling - Logistic Regression
+
+Logistic regression is used for modeling - it is appropriate given the binary nature of the dependent variable. The resulting model will give us the natural log of the odds ratio of default (in this case, "success" - a 1 result in the delqcat variable, is a default). We can exponentiate this result to give the odds of default, which will naturally help decide on whether to offer credit.
+
+To start, the data is split into a training data set (25% of total observations - 313,857 observations) and a validation data set (75% of total observations - 941,572 observations). All predictor variables are put in the model and backwards elimination is used to reduce the variable count. Backwards elimination starts with all variables in the model, and removes variables based on comparing the AIC (Akaike Information Criterion) of the model with the given variable and the model without the given variable. The AIC penalizes complexity (more independent variables), and so is often preferred to using the p-value for automated selection.
+
+The leaps package in R is used to complete the variable selection. The nbest=2 option is used to output the top 2 performing models (based on minimizing AIC) for each number of variable. In other words, the output includes the best 2 models with 4 predictors, 5 predictors,... up to 75 predictors, which the maximum number of predictors set using the maxvars option.
+
+Because the goal is both to predict defaults and create the most simple model possible, models are created with the best models using 4 to 11 predictors, and one is used creating the best 75 variable set. At this point in the modeling, there are occasional instances of a variable appearing twice in the model in two different forms (e.g. raw form plus a log odds transformation). In these cases, the model is run several ways, using some form of "drop one of the variables and re-run the model", and sometimes replacing the dropped form of the variable with another variable altogether. This is the "tinkering" stage of model development, when variables that seemed predictive but didn't make the final selected model are tried and removed to improve results. However - the chosen model is subjective and subject to tradeoffs, and the final model chosen is an 8-predictor model returned by the automated selection process.  Table 7 shows the descriptions of the variables includes in the final model, and the model equation is:
+
+$$ ln(\frac{\pi}{(1-\pi)}) =0.11TOPEN12 + 3.74BRADB\_odds + 1.33BRCRATE1\_odds+3.98BRHIC\_odds$$
+$$+3.6RBAL\_odds+2.76TR4524\_odds+3.07TRR23\_odds+6.16TSBAL\_odds$$
+
+```{r echo=FALSE}
+#Table 7 (model results with estimate/standard error/wald chi-square Pval)
+table7 <- data.frame(Variable=c("TOPEN12","BRADB_odds","BRCRATE1","BRHIC_odds","RBAL_odds","TR4524_odds",
+                                "TRR23_odds","TSBAL_odds"),
+                     Description=c("# of accounts opened in last 12 months","Average Debt Burden in Bank Revolving Account","# of Bank Revolving Accounts Currently Satisfactory",
+                                   "Total High Credits - Bank Revolving Account",
+                                   "Total Balance on Open Revolving Trades",
+                                   "# of Accounts 90+ Days in Past 24 Months",
+                                   "# of Accounts 30 Days Late in Past 24 Months",
+                                   "Total Open Balances"))
+kable(table7,caption="Table 7: Best Performing Logistic Regression Model Variable Descriptions")
+```
+
+###Furthur Comparison with ROC/AUC
+
+The ROC Chart has the true positive rate on the y-axis and the false positive rate on the x-axis. Choosing at random, we expect these rates to be the same - an 0.5 false positive rate corresponds to an 0.5 true positive rate. The model true/false positive rates are plotted against this random line and the area between the ROC curve and the line gives us some idea of the models ability to correctly identify an event. A higher AUC (area under the curve) indicates a model is better able to differentiate true from false positives.
+
+The R package ROCR is used both to create the ROC curve and determine the AUC. Figure 5 shows the ROC curve for the final selected model with 8 variables (AUC - 0.880). This performs almost as well as the full model with 75 variables (AUC - 0.895).
+
+![](images/roccurve8.png)
+
+
+```{r eval=FALSE}
+#Score model and use ROCR package to get AUC and ROC curve
+library(ROCR)
+fitted <- predict(best8.mdl,type="response",test)
+pred <- prediction(fitted,test$GOODBAD)
+roc.auc <- performance(pred,measure="auc")
+roc.perf <- performance(pred,measure="tpr",x.measure="fpr")
+
+AUC <- roc.auc@y.values[[1]]
+KSD <- max(attr(roc.perf,'y.values')[[1]]-attr(roc.perf,'x.values')[[1]])
+
+plotdata <- sample_frac(data.frame(xvals = roc.perf@x.values[[1]], yvals = roc.perf@y.values[[1]]),size=0.0001)
+
+ggplot(plotdata,aes(y=yvals,x=xvals)) +
+  geom_line(size=1.5,col="grey") +
+  theme_bw() +
+  scale_x_continuous(breaks=seq(0,1,0.1)) +
+  scale_y_continuous(breaks=seq(0,1,0.1),limits=c(0,1)) +
+  ggtitle("Figure 5: ROC Curve for 8 Variable Best Fit Model") +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  ylab("Sensitivity") +
+  xlab("1 - Specificity")
+
+```
+
+
+###Choosing a cutoff point and determining profit
+
+Next, a profit function is applied to the model and a cutoff point is chosen to maximize profit. The cutoff point is the estimated default rate at which an applicant's credit application will be rejected. For example, if a cutoff point of 50% is chosen, then all applicants with a probability of default greater than 50% will be rejected.
+
+If we choose a very low cutoff point, then very few people will be offered credit. So, losses will be low, but there will be no profits. The 0% and 1% cutoff points in this case are the equivalent of not doing business. The 100% cutoff point would mean offering credit to every applicant, no matter the risk of default. In this case, that's still profitable given the same conditions, though much less profitable than discriminating between applicants. And naturally, the long-term business consequences would be greater.
+
+To determine the profit at each cutoff point, we determine two things. First, whether offering credit would be profitable to a given applicant. Second, if there's a loss, how large is the loss? The profit is given at $250 per successful (i.e. repaid) loan. We have a credit limit variable, crelim, that we will use to determine loss. The loss is estimated at one half of the credit limit as in most cases, a defaulting user will either not have used the maximum credit available or their ability to borrow would have been removed by the time an attempt is made to use more credit.
+
+Figure 5 shows which cases are profitable, and which result in a loss. If we predict no default (again - based on a chosen cutoff point), and there is no default, we see a profit. This is a 0/0 in the figure. A 0/1 (Predicted no default, and customer defaults), then we have a loss, which is a Type 2 error.
+
+
+
+<center>![Figure 5: Model Predicted vs Actual Results](images/resultmatrix.png)</center>
+
+
+
+To determine where to set the cutoff point, we use our model on the validation data set and calculate the profit per 1,000 people at each cutoff point. Table 8 shows a sample of profits at various cutoff points. In the full 75 variable model, the optimal cutoff point is 21%, while it's only 19% in the 8 variable model.
+
+```{r, echo=FALSE}
+table8 <- read.csv("knitrfiles/profitcompare.csv")
+names(table8) <- c("Cutpoint","75 predictor model","8 predictor model")
+kable(table8,caption="Table 8: Comparison of Profit Per 1,000 in 75 and 8 Variable Models",align="r")
+```
+
+
+In R, the initial calculation is straightforward: choose a cutoff point, create predicted values in the test data, determine the outcome type (0/0, 0/1, 1/0, 1/1), and assign profit or loss figures to each result. To make the task easier, the cutoff points can be set in a loop to add rows shows profit for results at each cutoff point to a table at each iteration (shown below).
+
+Figure 6 shows the function of profit at each cutoff point (calculated in 1% increments). Profit is maximized at \$132,580 per 1,000 customers by choosing a cutoff point of 19%. In the 75 variable model, the highest profit achieved is \$135,600, or about \$3 more per person. We can see a consistent advantage in the 75 variable model - however, this model does not consider the costs of collecting the additional 67 variables - in a practical application, the cost of these inputs may well exceed the \$3 per person gained in the larger model, not to mention the additional complexity and difficulty of explaining a 75 variable model versus a model with only 8 inputs.
+
+
+![](images/cutpointcompplot.png)
+
+
+The code for creating a table with profit shown at each potential cutpoint is below. To improve speed, the dataset was reduced to only the variables used in analysis. The code runs and outputs results in under 5 minutes.
+
+```{r eval=FALSE}
+reducedtest <- test[,names(test) %in% names(best8)]
+
+for (cutpoint in seq(0,1,0.01)) {
+if (cutpoint != 0) {
+preds <- ifelse(fitted<cutpoint,0,1)
+probset <- cbind(preds,reducedtest)
+probset$CRELIM2 <- probset$CRELIM/2
+probset$outcometype <- rep("ERR",nrow(probset))
+probset$profit <- rep(-1,nrow(probset))
+probset$outcometype <- with(probset,ifelse(preds==0 & GOODBAD==0,outcometype<-"VALID2",
+                                    ifelse(preds==0 & GOODBAD==1,outcometype<-"ERROR1",
+                                    ifelse(preds==1 & GOODBAD==1,outcometype<-"VALID1",
+                                    ifelse(preds==1 & GOODBAD==0,outcometype<-"ERROR2",
+                                           outcometype<-"ERR")))))
+probset$profit <- with(probset,ifelse(outcometype=="VALID2",profit<-250,
+                               ifelse(outcometype=="ERROR1",profit<- -CRELIM2,
+                                      profit <- 0)))
+test <- probset %>% group_by(outcometype) %>% summarise(profit = sum(profit),pp1000=sum(profit)/n()*1000)
+final <- rbind(test,c("Total Profit",sum(probset$profit),sum(probset$profit)/nrow(probset)*1000))
+hold <- data.frame(Cutpoint = cutpoint, Total.Profit=final$profit[5], ProfitPer1000=final$pp1000[5])
+results <- rbind(results,hold)
+} else {
+  results <- data.frame(Cutpoint=0,Total.Profit=0,ProfitPer1000=0)
+}}
+```
+
+
+
+##Limitations and Weaknesses
+
+
+
+Knowing how the variables are coded would allow for more accurate modeling. In this case, the coded values are assumed to be "average". This is an educated guess, but still a guess. Of course, there's no substitute for knowing what the values should be. The values are imputed at the median to keep them somewhat close to an "average". However - if the coded values are extreme values of some kind the model would be very different. In any case, not knowing how to interpret the coded values means important information is missing.
+
+An assumption is made when creating the GOODBAD variable - we assume those with a 0 for "Too new to rate" are a "non-default". This may not be the case. A deeper dive into the data with the too new to rate values treated as separate from the customers who did not default could produce more accurate results.
+
+
+
+##Conclusion
+
+After data cleaning, variable reduction, and discretization, the final model is performing well with 8 variables. Using all significant predictors, we can improve the profit per 1,000 customers figure by $3 per customer. However, this requires 67 additional variables. By selectively choosing only 8 variables, the reduction in performance is minimal. Though profitability as calculated is better with the full 75 variable model, there is a cost associated with those variables. In addition, a 75-variable model is more difficult to interpret and somewhat obscures which inputs are truly valuable. It's unlikely all 75 variables provide value that is not provided by one of the other variables.
+
+
+
